@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,11 +41,13 @@ import (
 // Plugin is identical to DevicePluginServer interface of device plugin API.
 type AMDGPUPlugin struct {
 	AMDGPUs            map[string]map[string]interface{}
+	physicalAMDGPUs    map[string]map[string]interface{}
 	Heartbeat          chan bool
 	signal             chan os.Signal
 	Resource           string
 	devAllocator       allocator.Policy
 	allocatorInitError bool
+	Replica            int
 }
 
 type AMDGPUPluginOption func(*AMDGPUPlugin)
@@ -68,9 +71,19 @@ func WithHeartbeat(ch chan bool) AMDGPUPluginOption {
 		p.Heartbeat = ch
 	}
 }
+
 func WithResource(res string) AMDGPUPluginOption {
 	return func(p *AMDGPUPlugin) {
 		p.Resource = res
+	}
+}
+
+func WithReplica(replica int) AMDGPUPluginOption {
+	return func(p *AMDGPUPlugin) {
+		if replica < 1 {
+			replica = 1
+		}
+		p.Replica = replica
 	}
 }
 
@@ -82,7 +95,8 @@ func WithResource(res string) AMDGPUPluginOption {
 func (p *AMDGPUPlugin) Start() error {
 	p.signal = make(chan os.Signal, 1)
 	signal.Notify(p.signal, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
-	err := p.devAllocator.Init(getDevices(), "")
+	p.refreshAMDGPUs()
+	err := p.devAllocator.Init(getDevicesFromAMDGPUs(p.physicalAMDGPUs), "")
 	if err != nil {
 		glog.Errorf("allocator init failed. Falling back to kubelet default allocation. Error %v", err)
 		p.allocatorInitError = true
@@ -90,8 +104,45 @@ func (p *AMDGPUPlugin) Start() error {
 	return nil
 }
 
-func getDevices() []*allocator.Device {
-	devices := amdgpu.GetAMDGPUs()
+const (
+	physicalIDKey   = "physicalID"
+	replicaIndexKey = "replicaIndex"
+)
+
+func buildLogicalAMDGPUsFromPhysical(physical map[string]map[string]interface{}, replica int) map[string]map[string]interface{} {
+	if replica < 1 {
+		replica = 1
+	}
+	logical := make(map[string]map[string]interface{})
+	for id, deviceData := range physical {
+		for i := 0; i < replica; i++ {
+			logicalID := id
+			if replica > 1 {
+				logicalID = fmt.Sprintf("%s-%d", id, i)
+			}
+			logicalDeviceData := cloneDeviceData(deviceData)
+			logicalDeviceData[physicalIDKey] = id
+			logicalDeviceData[replicaIndexKey] = i
+			logical[logicalID] = logicalDeviceData
+		}
+	}
+	return logical
+}
+
+func cloneDeviceData(deviceData map[string]interface{}) map[string]interface{} {
+	cloned := make(map[string]interface{}, len(deviceData)+2)
+	for k, v := range deviceData {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+func (p *AMDGPUPlugin) refreshAMDGPUs() {
+	p.physicalAMDGPUs = amdgpu.GetAMDGPUs()
+	p.AMDGPUs = buildLogicalAMDGPUsFromPhysical(p.physicalAMDGPUs, p.Replica)
+}
+
+func getDevicesFromAMDGPUs(devices map[string]map[string]interface{}) []*allocator.Device {
 	var deviceList []*allocator.Device
 
 	for id, deviceData := range devices {
@@ -208,7 +259,7 @@ func simpleHealthCheck() bool {
 // GetDevicePluginOptions returns options to be communicated with Device
 // Manager
 func (p *AMDGPUPlugin) GetDevicePluginOptions(ctx context.Context, e *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
-	if p.allocatorInitError {
+	if p.allocatorInitError && p.Replica <= 1 {
 		return &pluginapi.DevicePluginOptions{}, nil
 	}
 	return &pluginapi.DevicePluginOptions{
@@ -228,7 +279,7 @@ func (p *AMDGPUPlugin) PreStartContainer(ctx context.Context, r *pluginapi.PreSt
 // returns the new list
 func (p *AMDGPUPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 
-	p.AMDGPUs = amdgpu.GetAMDGPUs()
+	p.refreshAMDGPUs()
 
 	glog.Infof("Found %d AMDGPUs", len(p.AMDGPUs))
 
@@ -337,7 +388,7 @@ loop:
 func (p *AMDGPUPlugin) GetPreferredAllocation(ctx context.Context, req *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
 	response := &pluginapi.PreferredAllocationResponse{}
 	for _, req := range req.ContainerRequests {
-		allocated_ids, err := p.devAllocator.Allocate(req.AvailableDeviceIDs, req.MustIncludeDeviceIDs, int(req.AllocationSize))
+		allocated_ids, err := p.getPreferredAllocation(req.AvailableDeviceIDs, req.MustIncludeDeviceIDs, int(req.AllocationSize))
 		if err != nil {
 			glog.Errorf("unable to get preferred allocation list. Error:%v", err)
 			return nil, fmt.Errorf("unable to get preferred allocation list. Error:%v", err)
@@ -350,39 +401,265 @@ func (p *AMDGPUPlugin) GetPreferredAllocation(ctx context.Context, req *pluginap
 	return response, nil
 }
 
+func (p *AMDGPUPlugin) getPreferredAllocation(availableIDs, requiredIDs []string, size int) ([]string, error) {
+	if p.Replica <= 1 {
+		return p.devAllocator.Allocate(availableIDs, requiredIDs, size)
+	}
+	return p.getReplicaPreferredAllocation(availableIDs, requiredIDs, size)
+}
+
+type replicaDeviceGroup struct {
+	physicalID    string
+	candidateIDs  []string
+	selectedCount int
+}
+
+func (p *AMDGPUPlugin) getReplicaPreferredAllocation(availableIDs, requiredIDs []string, size int) ([]string, error) {
+	outset := []string{}
+	if size <= 0 {
+		return outset, fmt.Errorf("allocation size should be positive integer")
+	}
+	if len(availableIDs) < size {
+		return outset, fmt.Errorf("available devices count less than allocation size")
+	}
+	if len(requiredIDs) > size {
+		return outset, fmt.Errorf("must_include devices size is more than allocation size")
+	}
+	if !stringSetContainsAll(availableIDs, requiredIDs) {
+		return outset, fmt.Errorf("must_include devices must be part of available devices")
+	}
+	if len(availableIDs) == size {
+		return copyStringSlice(availableIDs), nil
+	}
+	if len(requiredIDs) == size {
+		return copyStringSlice(requiredIDs), nil
+	}
+	if p.AMDGPUs == nil {
+		p.refreshAMDGPUs()
+	}
+
+	groups := make(map[string]*replicaDeviceGroup)
+	requiredSet := makeStringSet(requiredIDs)
+	outset = append(outset, requiredIDs...)
+	for _, id := range availableIDs {
+		deviceData, ok := p.AMDGPUs[id]
+		if !ok {
+			return nil, fmt.Errorf("unknown available device ID %q", id)
+		}
+		physicalID := physicalIDForDevice(id, deviceData)
+		group, ok := groups[physicalID]
+		if !ok {
+			group = &replicaDeviceGroup{physicalID: physicalID}
+			groups[physicalID] = group
+		}
+		if _, required := requiredSet[id]; required {
+			group.selectedCount++
+			continue
+		}
+		group.candidateIDs = append(group.candidateIDs, id)
+	}
+	for _, id := range requiredIDs {
+		if _, ok := p.AMDGPUs[id]; !ok {
+			return nil, fmt.Errorf("unknown required device ID %q", id)
+		}
+	}
+	for _, group := range groups {
+		sortDeviceIDsByPhysicalReplica(group.candidateIDs, p.AMDGPUs)
+	}
+
+	remaining := size - len(requiredIDs)
+	requiredPhysicalIDs := getRequiredPhysicalIDs(groups)
+	availablePhysicalIDs := getSortedPhysicalIDs(groups)
+	targetPhysicalCount := len(requiredPhysicalIDs) + remaining
+	if targetPhysicalCount > len(availablePhysicalIDs) {
+		targetPhysicalCount = len(availablePhysicalIDs)
+	}
+
+	selectedPhysicalIDs := p.preferPhysicalIDs(availablePhysicalIDs, requiredPhysicalIDs, targetPhysicalCount)
+	for _, physicalID := range selectedPhysicalIDs {
+		if remaining == 0 {
+			break
+		}
+		group := groups[physicalID]
+		if group == nil || group.selectedCount > 0 || len(group.candidateIDs) == 0 {
+			continue
+		}
+		outset = append(outset, popReplicaCandidate(group))
+		remaining--
+	}
+
+	for remaining > 0 {
+		fillOrder := getSortedPhysicalIDs(groups)
+		sort.SliceStable(fillOrder, func(i, j int) bool {
+			left := groups[fillOrder[i]]
+			right := groups[fillOrder[j]]
+			if left.selectedCount == right.selectedCount {
+				return fillOrder[i] < fillOrder[j]
+			}
+			return left.selectedCount < right.selectedCount
+		})
+		progress := false
+		for _, physicalID := range fillOrder {
+			if remaining == 0 {
+				break
+			}
+			group := groups[physicalID]
+			if group == nil || len(group.candidateIDs) == 0 {
+				continue
+			}
+			outset = append(outset, popReplicaCandidate(group))
+			remaining--
+			progress = true
+		}
+		if !progress {
+			return nil, fmt.Errorf("unable to find enough replica candidates")
+		}
+	}
+
+	return outset, nil
+}
+
+func (p *AMDGPUPlugin) preferPhysicalIDs(availablePhysicalIDs, requiredPhysicalIDs []string, size int) []string {
+	if size <= len(requiredPhysicalIDs) {
+		return copyStringSlice(requiredPhysicalIDs)
+	}
+	if !p.allocatorInitError && p.devAllocator != nil {
+		allocatedIDs, err := p.devAllocator.Allocate(availablePhysicalIDs, requiredPhysicalIDs, size)
+		if err == nil && len(allocatedIDs) == size && stringSetContainsAll(allocatedIDs, requiredPhysicalIDs) {
+			return allocatedIDs
+		}
+		glog.Warningf("replica preferred allocation falling back to deterministic physical spread: %v", err)
+	}
+
+	selected := copyStringSlice(requiredPhysicalIDs)
+	selectedSet := makeStringSet(selected)
+	for _, id := range availablePhysicalIDs {
+		if len(selected) == size {
+			break
+		}
+		if _, exists := selectedSet[id]; exists {
+			continue
+		}
+		selected = append(selected, id)
+		selectedSet[id] = struct{}{}
+	}
+	return selected
+}
+
+func physicalIDForDevice(id string, deviceData map[string]interface{}) string {
+	if physicalID, ok := deviceData[physicalIDKey].(string); ok && physicalID != "" {
+		return physicalID
+	}
+	return id
+}
+
+func replicaIndexForDevice(deviceData map[string]interface{}) int {
+	if idx, ok := deviceData[replicaIndexKey].(int); ok {
+		return idx
+	}
+	return 0
+}
+
+func popReplicaCandidate(group *replicaDeviceGroup) string {
+	id := group.candidateIDs[0]
+	group.candidateIDs = group.candidateIDs[1:]
+	group.selectedCount++
+	return id
+}
+
+func getRequiredPhysicalIDs(groups map[string]*replicaDeviceGroup) []string {
+	ids := make([]string, 0, len(groups))
+	for physicalID, group := range groups {
+		if group.selectedCount > 0 {
+			ids = append(ids, physicalID)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func getSortedPhysicalIDs(groups map[string]*replicaDeviceGroup) []string {
+	ids := make([]string, 0, len(groups))
+	for physicalID := range groups {
+		ids = append(ids, physicalID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func sortDeviceIDsByPhysicalReplica(ids []string, devices map[string]map[string]interface{}) {
+	sort.Slice(ids, func(i, j int) bool {
+		leftID := ids[i]
+		rightID := ids[j]
+		leftData := devices[leftID]
+		rightData := devices[rightID]
+		leftPhysicalID := physicalIDForDevice(leftID, leftData)
+		rightPhysicalID := physicalIDForDevice(rightID, rightData)
+		if leftPhysicalID != rightPhysicalID {
+			return leftPhysicalID < rightPhysicalID
+		}
+		leftReplicaIndex := replicaIndexForDevice(leftData)
+		rightReplicaIndex := replicaIndexForDevice(rightData)
+		if leftReplicaIndex != rightReplicaIndex {
+			return leftReplicaIndex < rightReplicaIndex
+		}
+		return leftID < rightID
+	})
+}
+
+func stringSetContainsAll(set, subset []string) bool {
+	setMap := makeStringSet(set)
+	for _, id := range subset {
+		if _, ok := setMap[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func makeStringSet(ids []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	return set
+}
+
+func copyStringSlice(ids []string) []string {
+	copied := make([]string, len(ids))
+	copy(copied, ids)
+	return copied
+}
+
 // Allocate is called during container creation so that the Device
 // Plugin can run device specific operations and instruct Kubelet
 // of the steps to make the Device available in the container
 func (p *AMDGPUPlugin) Allocate(ctx context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	var response pluginapi.AllocateResponse
 	var car pluginapi.ContainerAllocateResponse
-	var dev *pluginapi.DeviceSpec
 
 	for _, req := range r.ContainerRequests {
 		car = pluginapi.ContainerAllocateResponse{}
+		seenDevicePaths := make(map[string]struct{})
 
 		// Currently, there are only 1 /dev/kfd per nodes regardless of the # of GPU available
 		// for compute/rocm/HSA use cases
-		dev = new(pluginapi.DeviceSpec)
-		dev.HostPath = "/dev/kfd"
-		dev.ContainerPath = "/dev/kfd"
-		dev.Permissions = "rw"
-		car.Devices = append(car.Devices, dev)
+		appendDeviceSpec(&car, seenDevicePaths, "/dev/kfd")
 
 		for _, id := range req.DevicesIDs {
 			glog.Infof("Allocating device ID: %s", id)
 
-			for k, v := range p.AMDGPUs[id] {
-				// Map struct previously only had 'card' and 'renderD' and only those are paths to be appended as before
-				if k != "card" && k != "renderD" {
-					continue
+			deviceData, ok := p.AMDGPUs[id]
+			if !ok {
+				return nil, fmt.Errorf("unknown device ID %q in allocation request", id)
+			}
+			for _, k := range []string{"card", "renderD"} {
+				v, ok := deviceData[k]
+				if !ok {
+					return nil, fmt.Errorf("device ID %q is missing %s data", id, k)
 				}
 				devpath := fmt.Sprintf("/dev/dri/%s%d", k, v)
-				dev = new(pluginapi.DeviceSpec)
-				dev.HostPath = devpath
-				dev.ContainerPath = devpath
-				dev.Permissions = "rw"
-				car.Devices = append(car.Devices, dev)
+				appendDeviceSpec(&car, seenDevicePaths, devpath)
 			}
 		}
 
@@ -392,6 +669,18 @@ func (p *AMDGPUPlugin) Allocate(ctx context.Context, r *pluginapi.AllocateReques
 	return &response, nil
 }
 
+func appendDeviceSpec(car *pluginapi.ContainerAllocateResponse, seenDevicePaths map[string]struct{}, devpath string) {
+	if _, exists := seenDevicePaths[devpath]; exists {
+		return
+	}
+	seenDevicePaths[devpath] = struct{}{}
+	car.Devices = append(car.Devices, &pluginapi.DeviceSpec{
+		HostPath:      devpath,
+		ContainerPath: devpath,
+		Permissions:   "rw",
+	})
+}
+
 // Lister serves as an interface between imlementation and Manager machinery. User passes
 // implementation of this interface to NewManager function. Manager will use it to obtain resource
 // namespace, monitor available resources and instantate a new plugin for them.
@@ -399,6 +688,7 @@ type AMDGPULister struct {
 	ResUpdateChan chan dpm.PluginNameList
 	Heartbeat     chan bool
 	Signal        chan os.Signal
+	Replica       int
 }
 
 // GetResourceNamespace must return namespace (vendor ID) of implemented Lister. e.g. for
@@ -433,6 +723,7 @@ func (l *AMDGPULister) NewPlugin(resourceLastName string) dpm.PluginInterface {
 		WithHeartbeat(l.Heartbeat),
 		WithResource(resourceLastName),
 		WithAllocator(allocator.NewBestEffortPolicy()),
+		WithReplica(l.Replica),
 	}
 	return NewAMDGPUPlugin(options...)
 }

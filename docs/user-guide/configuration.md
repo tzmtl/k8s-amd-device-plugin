@@ -29,6 +29,15 @@ The device plugin supports the following command-line flags:
 |-----|------|-------------|
 | `-pulse` | `0` | Time between health check polling in seconds. Set to 0 to disable. |
 | `-resource_naming_strategy` | `single` | Resource naming strategy used for Kubernetes resource reporting. |
+| `-replica` | `1` | Number of logical AMD GPU devices to expose per physical GPU (GPU sharing). |
+
+### GPU Sharing with `-replica`
+
+The `-replica` flag oversubscribes each physical AMD GPU by advertising multiple logical device plugin IDs to Kubernetes. For example, a node with 2 physical GPUs and `-replica=4` reports 8 allocatable AMD GPU resources.
+
+This feature is scheduler-level sharing only. All replicas of the same physical GPU map to the same `/dev/kfd` and `/dev/dri` devices. It does not provide memory isolation, compute isolation, throttling, or hardware partitioning.
+
+When a pod requests multiple logical AMD GPUs, the plugin prefers to spread the allocation across distinct physical GPUs first. If the request is larger than the number of physical GPUs with available replicas, the remaining logical devices are assigned as additional replicas.
 
 ## Configuration File
 

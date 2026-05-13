@@ -106,8 +106,10 @@ func main() {
 	}
 	var pulse int
 	var resourceNamingStrategy string
+	var replica int
 	flag.IntVar(&pulse, "pulse", 0, "time between health check polling in seconds.  Set to 0 to disable.")
 	flag.StringVar(&resourceNamingStrategy, "resource_naming_strategy", "single", "Resource strategy to be used: single or mixed")
+	flag.IntVar(&replica, "replica", 1, "number of logical AMD GPU devices to expose per physical device (GPU sharing). Must be >= 1.")
 	// this is also needed to enable glog usage in dpm
 	flag.Parse()
 	strategy, err := ParseStrategy(resourceNamingStrategy)
@@ -123,6 +125,7 @@ func main() {
 	l := plugin.AMDGPULister{
 		ResUpdateChan: make(chan dpm.PluginNameList),
 		Heartbeat:     make(chan bool),
+		Replica:       replica,
 	}
 	manager := dpm.NewManager(&l)
 

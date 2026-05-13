@@ -9,6 +9,9 @@ dp:
     repository: docker.io/rocm/k8s-device-plugin
     # Overrides the image tag whose default is the chart appVersion.
     tag: "1.31.0.9"
+  # Number of logical AMD GPU devices to expose per physical GPU.
+  # Set this > 1 to enable simple GPU sharing on each node.
+  replica: 1
   resources: {}
   # Set daemonsets updateStrategy for device plugin
   updateStrategy:
